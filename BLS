@@ -1,0 +1,146 @@
+import requests
+import json
+import pandas as pd
+import psycopg2
+from io import StringIO
+import sys
+from datetime import datetime
+
+# --- ETL Pipeline Script ---
+
+# 1. Extract: Retrieve data from the BLS API
+
+# Define the BLS API endpoint
+url = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
+
+# A list of state series IDs for 'All Employees, In thousands, Seasonally Adjusted'
+# Sourced from the BLS documentation. This is a small sample.
+# The format is 'LAS' + state_code + measure_code
+# 'LAU' is for Local Area Unemployment, 'LAS' is seasonally adjusted.
+# State codes are two-digit (e.g., 01 for Alabama).
+# '06' is the code for 'All Employees'.
+# You would need to create a comprehensive list for all 50 states.
+# For example: LASST0100000000006 is Alabama, total employed.
+
+# For this example, we will use a small list of series IDs for a few states
+series_ids = [
+    "LASST0100000000006",  # Alabama
+    "LASST0600000000006",  # California
+    "LASST1200000000006",  # Florida
+    "LASST4800000000006",  # Texas
+]
+
+# Note: For production use and higher query limits, consider registering for an API key.
+# Without a key, the limits are 25 series and 10 years per query.
+payload = {
+    "seriesid": series_ids,
+    "startyear": "2015",
+    "endyear": "2020",
+    "catalog": True,
+}
+
+headers = {"Content-Type": "application/json"}
+
+try:
+    response = requests.post(url, data=json.dumps(payload), headers=headers)
+    response.raise_for_status()  # Raise an exception for bad status codes
+    data_json = response.json()
+
+    if data_json.get("status") != "REQUEST_SUCCEEDED":
+        print(f"Error from BLS API: {data_json.get('message')}")
+        sys.exit(1)
+        
+    print("Data extracted successfully from BLS API.")
+
+    # 2. Transform: Process data with pandas
+    
+    all_states_df = pd.DataFrame()
+    
+    # Iterate through the API response for each series (state)
+    for series in data_json["Results"]["series"]:
+        series_id = series["seriesID"]
+        state = series["seriesName"].split(",")[0]  # Extract state name from seriesName
+        
+        extracted_data = []
+        for item in series["data"]:
+            year = item["year"]
+            period = item["period"]
+            value = item["value"]
+            
+            # Convert 'M' periods to proper date
+            if period.startswith("M"):
+                month = int(period[1:])
+                date_str = f"{year}-{month:02d}-01"
+                extracted_data.append({"date": date_str, "state": state, "total_employment": value})
+
+        # Create a temporary DataFrame for the current state
+        state_df = pd.DataFrame(extracted_data)
+        state_df["date"] = pd.to_datetime(state_df["date"])
+        state_df["total_employment"] = pd.to_numeric(state_df["total_employment"], errors="coerce")
+        state_df = state_df.sort_values(by="date").reset_index(drop=True)
+        
+        # Calculate month-over-month changes for the current state
+        state_df["mom_change_abs"] = state_df["total_employment"].diff()
+        state_df["mom_change_pct"] = state_df["total_employment"].pct_change() * 100
+        
+        # Clean the data by dropping any rows with missing values
+        state_df.dropna(inplace=True)
+        
+        # Append to the main DataFrame
+        all_states_df = pd.concat([all_states_df, state_df], ignore_index=True)
+
+    print("\nData transformed successfully:")
+    print(all_states_df.head())
+
+    # 3. Load: Connect and load data into PostgreSQL
+
+    # Database connection details (replace with your own)
+    DB_HOST = "your_host"
+    DB_NAME = "your_database"
+    DB_USER = "your_user"
+    DB_PASS = "your_password"
+
+    table_name = "state_employment"
+
+    try:
+        # Connect to the PostgreSQL database
+        conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASS)
+        cur = conn.cursor()
+
+        # Create the table if it does not exist
+        # Note: Added a 'state' column
+        create_table_query = f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            date DATE,
+            state VARCHAR(50),
+            total_employment NUMERIC,
+            mom_change_abs NUMERIC,
+            mom_change_pct NUMERIC,
+            PRIMARY KEY (date, state)
+        );
+        """
+        cur.execute(create_table_query)
+        conn.commit()
+        print(f"\nTable '{table_name}' ensured to exist.")
+
+        # Efficiently load data from DataFrame using copy_from
+        buffer = StringIO()
+        all_states_df.to_csv(buffer, header=False, index=False)
+        buffer.seek(0)
+        
+        cur.copy_from(buffer, table_name, sep=",", columns=("date", "state", "total_employment", "mom_change_abs", "mom_change_pct"))
+        conn.commit()
+        print(f"Data successfully loaded into '{table_name}' table.")
+
+    except (psycopg2.OperationalError, psycopg2.DatabaseError) as e:
+        print(f"Database error: {e}")
+        conn.rollback()
+    finally:
+        if "conn" in locals() and conn is not None:
+            cur.close()
+            conn.close()
+            print("Database connection closed.")
+
+except requests.exceptions.RequestException as e:
+    print(f"Error connecting to BLS API: {e}")
+    sys.exit(1)
