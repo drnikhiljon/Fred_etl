@@ -95,7 +95,7 @@ Use environment variables (DB_NAME, DB_USER, DB_PASSWORD, DB_HOST) for database 
 Output Format
 
 
-Deliver a single Python file, ready to run with streamlit run filename.py.
+Deliver a single Python file, ready to run with streamlit run dashboard.py.
 
 
 Include concise comments so another analyst can quickly understand each block.
